@@ -1,42 +1,43 @@
 package {{invokerPackage}};
 
-import com.fasterxml.jackson.core.JsonGenerator.Feature;
-import com.fasterxml.jackson.databind.*;
-import com.fasterxml.jackson.annotation.*;
-import com.fasterxml.jackson.databind.annotation.JsonSerialize;
-
-import com.mendix.cloud.urlsign.URLSign;
+import brave.Tracing;
+import com.fasterxml.jackson.databind.JavaType;
+import com.github.kristofa.brave.Brave;
+import com.github.kristofa.brave.TracerAdapter;
+import com.github.kristofa.brave.http.HttpRequest;
+import com.github.kristofa.brave.http.SpanNameProvider;
+import com.github.kristofa.brave.jersey.JerseyClientTraceFilter;
 import com.sun.jersey.api.client.Client;
 import com.sun.jersey.api.client.ClientResponse;
+import com.sun.jersey.api.client.WebResource;
+import com.sun.jersey.api.client.WebResource.Builder;
 import com.sun.jersey.api.client.config.ClientConfig;
 import com.sun.jersey.api.client.config.DefaultClientConfig;
 import com.sun.jersey.api.client.filter.LoggingFilter;
-import com.sun.jersey.api.client.WebResource;
-import com.sun.jersey.api.client.WebResource.Builder;
 import com.sun.jersey.multipart.FormDataMultiPart;
+import okhttp3.HttpUrl;
+import org.apache.http.HttpResponse;
+import org.apache.http.client.methods.HttpGet;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.impl.client.HttpClients;
+import org.apache.http.util.EntityUtils;
+import zipkin.Span;
+import zipkin.reporter.AsyncReporter;
+import zipkin.reporter.Encoding;
+import zipkin.reporter.Reporter;
+import zipkin.reporter.okhttp3.OkHttpSender;
 
 import javax.ws.rs.core.Response.Status.Family;
-import javax.ws.rs.core.MediaType;
-
-import java.net.URI;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Map;
-import java.util.Map.Entry;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Date;
-import java.util.TimeZone;
-
-import java.net.URLEncoder;
-
 import java.io.IOException;
 import java.io.UnsupportedEncodingException;
-
+import java.net.URI;
+import java.net.URLEncoder;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
-import java.text.ParseException;
+import java.util.*;
+import java.util.Map.Entry;
 
+import com.mendix.cloud.urlsign.URLSign;
 import {{invokerPackage}}.auth.Authentication;
 import {{invokerPackage}}.auth.HttpBasicAuth;
 import {{invokerPackage}}.auth.ApiKeyAuth;
@@ -532,8 +533,66 @@ public class ApiClient {
       Client client = Client.create(config);
       if (debugging)
         client.addFilter(new LoggingFilter());
+      configureHttpTracing(client);
       hostMap.put(basePath, client);
     }
     return hostMap.get(basePath);
+  }
+
+  private void configureHttpTracing(Client client) {
+    URI baseUri = URI.create("https://trace-testfree-nonprod-1-eu-west-1.test.mendix.com");
+    if (!enableHttpTracing(baseUri.resolve("/health"))) {
+      return;
+    }
+    Brave brave = newBrave(baseUri);
+    SpanNameProvider spanNameProvider = newSpanNameProvider();
+    JerseyClientTraceFilter traceFilter =
+        JerseyClientTraceFilter.builder(brave).spanNameProvider(spanNameProvider).build();
+    client.addFilter(traceFilter);
+  }
+
+  private Brave newBrave(URI baseUri) {
+    OkHttpSender sender =
+        OkHttpSender.builder()
+            .encoding(Encoding.JSON)
+            .endpoint(HttpUrl.get(baseUri.resolve("/api/v1/spans")))
+            .build();
+    Reporter<Span> reporter = AsyncReporter.builder(sender).build();
+    Tracing v4Tracing = Tracing.newBuilder()
+            .localServiceName("CloudPortal")
+            .traceId128Bit(true)
+            .reporter(reporter)
+            .build();
+    return TracerAdapter.newBrave(v4Tracing.tracer());
+  }
+
+  private SpanNameProvider newSpanNameProvider() {
+    return new SpanNameProvider() {
+      @Override
+      public String spanName(HttpRequest request) {
+        return request.getUri().getPath();
+      }
+    };
+  }
+
+  private boolean enableHttpTracing(URI uri) {
+    HttpGet httpGet = new HttpGet(uri);
+    CloseableHttpClient client = HttpClients.createDefault();
+    try {
+      HttpResponse response = client.execute(httpGet);
+      final int status = response.getStatusLine().getStatusCode();
+      EntityUtils.consumeQuietly(response.getEntity());
+      httpGet.releaseConnection();
+      return status >= 200 && status < 300;
+    } catch (IOException e) {
+      //
+    } finally {
+      try {
+        client.close();
+      } catch (IOException e) {
+        //
+      }
+    }
+    return false;
   }
 }
